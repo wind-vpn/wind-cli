@@ -8,6 +8,7 @@
 #   WINDVPN_CLI_DIRECTORY  install directory (default: first writable of
 #                          ~/.local/bin, ~/bin, /usr/local/bin found in PATH,
 #                          otherwise ~/.local/bin)
+#   WINDVPN_CLI_SETCAP     set to 0 to skip granting CAP_NET_ADMIN (needed for TUN mode)
 
 set -efu
 
@@ -28,6 +29,50 @@ fail() {
 	if [ -t 1 ]; then printf '\r\033[K'; fi
 	printf '✗ %s\n' "$1" >&2
 	exit 1
+}
+
+warn() {
+	if [ -t 1 ]; then printf '\r\033[K'; fi
+	printf '! %s\n' "$1" >&2
+}
+
+find_setcap() {
+	if command -v setcap >/dev/null 2>&1; then
+		command -v setcap
+		return 0
+	fi
+	for candidate in /usr/sbin/setcap /sbin/setcap; do
+		if [ -x "$candidate" ]; then
+			printf '%s\n' "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# TUN mode needs CAP_NET_ADMIN. Granting it here, with an interactive sudo prompt,
+# avoids relying on a polkit agent at runtime. Never fatal: returns 1 on any problem.
+grant_tun_capability() {
+	case "${WINDVPN_CLI_SETCAP:-auto}" in
+		0|no|false|off) return 2 ;;
+	esac
+
+	target="$dir/windvpn-clid"
+
+	if ! setcap_bin=$(find_setcap); then
+		warn "setcap not found (install libcap2-bin or libcap)"
+		return 1
+	fi
+
+	if [ "$(id -u)" -eq 0 ]; then
+		"$setcap_bin" cap_net_admin+ep "$target" || return 1
+	elif command -v sudo >/dev/null 2>&1 && (: </dev/tty) 2>/dev/null; then
+		printf '• Granting CAP_NET_ADMIN to windvpn-clid (required for TUN mode, sudo password may be requested)\n'
+		sudo "$setcap_bin" cap_net_admin+ep "$target" || return 1
+	else
+		warn "no terminal or sudo available to grant permissions"
+		return 1
+	fi
 }
 
 [ "$(uname -s)" = Linux ] || fail "Unsupported OS: $(uname -s). windvpn-cli releases are Linux only"
@@ -175,9 +220,14 @@ if [ "$alias_ok" -eq 1 ]; then
 	mv -f "$tmp/out/windvpn" "$dir/windvpn" || fail "Failed to install windvpn"
 fi
 
-# Remove the alias installed by older versions of this script.
-if [ -L "$dir/jray" ] && [ "$(readlink "$dir/jray")" = windvpn-cli ]; then
-	rm -f "$dir/jray"
+# The capability is stored on the file, so it must be (re)applied after every update
+# and before the daemon is started again.
+tun_ready=0
+if grant_tun_capability; then
+	tun_ready=1
+	pass "Granted TUN permissions"
+else
+	[ "$?" -eq 2 ] || warn "Could not grant TUN permissions"
 fi
 
 if [ "$restart" -eq 1 ]; then
@@ -200,6 +250,10 @@ if [ "$alias_ok" -eq 1 ]; then
 else
 	cmd=windvpn-cli
 	printf '! %s/windvpn already exists and was left untouched\n' "$dir"
+fi
+
+if [ "$tun_ready" -eq 0 ]; then
+	printf '\nTo use TUN mode, run once (and again after each update):\n  sudo setcap cap_net_admin+ep "%s/windvpn-clid"\n' "$dir"
 fi
 
 case ":$PATH:" in
